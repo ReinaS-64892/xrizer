@@ -10,7 +10,7 @@ use openxr as xr;
 use std::mem::ManuallyDrop;
 use std::sync::{
     RwLock,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicU8, Ordering},
 };
 use std::time::Duration;
 
@@ -43,10 +43,19 @@ pub struct OpenXrData<C: Compositor> {
     pub display_time: AtomicXrTime,
     pub display_period_nanos: AtomicI64,
     pub enabled_extensions: xr::ExtensionSet,
+    user_presence: AtomicU8,
 
     /// should only be externally accessed for testing
     pub(crate) input: Injected<crate::input::Input<C>>,
     pub(crate) compositor: Injected<C>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserPresence {
+    Unsupported = 0,
+    Unknown = 1,
+    Present = 2,
+    NotPresent = 3,
 }
 
 impl<C: Compositor> Drop for OpenXrData<C> {
@@ -63,6 +72,7 @@ pub enum InitError {
     EnumeratingExtensionsFailed(xr::sys::Result),
     InstanceCreationFailed(xr::sys::Result),
     SystemCreationFailed(xr::sys::Result),
+    SystemPropertiesFailed(xr::sys::Result),
     SessionCreationFailed(SessionCreationError),
 }
 
@@ -136,6 +146,7 @@ impl<C: Compositor> OpenXrData<C> {
             supported_exts.htc_vive_focus3_controller_interaction;
         exts.meta_touch_controller_plus = supported_exts.meta_touch_controller_plus;
         exts.fb_display_refresh_rate = supported_exts.fb_display_refresh_rate;
+        exts.ext_user_presence = supported_exts.ext_user_presence;
 
         // Extension that enables simple full body tracking support via generic tracked devices.
         // Available only in the Monado OpenXR runtime.
@@ -166,6 +177,30 @@ impl<C: Compositor> OpenXrData<C> {
             .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
             .map_err(InitError::SystemCreationFailed)?;
 
+        let user_presence = if exts.ext_user_presence {
+            // openxr does not expose this extension's system properties through its safe API.
+            let supported = unsafe {
+                let mut presence =
+                    xr::sys::SystemUserPresencePropertiesEXT::out(std::ptr::null_mut());
+                let mut properties = xr::sys::SystemProperties::out(presence.as_mut_ptr().cast());
+                let result = (instance.fp().get_system_properties)(
+                    instance.as_raw(),
+                    system_id,
+                    properties.as_mut_ptr(),
+                );
+                if result.into_raw() < 0 {
+                    return Err(InitError::SystemPropertiesFailed(result));
+                }
+                bool::from(presence.assume_init().supports_user_presence)
+            };
+            if supported {
+                UserPresence::Unknown
+            } else {
+                UserPresence::Unsupported
+            }
+        } else {
+            UserPresence::Unsupported
+        };
         let session_data = SessionReadGuard(RwLock::new(ManuallyDrop::new(
             SessionData::new(
                 &instance,
@@ -190,6 +225,7 @@ impl<C: Compositor> OpenXrData<C> {
             display_time: AtomicXrTime(display_time.into()), // This will get replaced on the first WaitGetPoses
             display_period_nanos: 11111111.into(), // This will get replaced on the first WaitGetPoses
             enabled_extensions: exts,
+            user_presence: AtomicU8::new(user_presence as u8),
             input: injector.inject(),
             compositor: injector.inject(),
         })
@@ -201,6 +237,20 @@ impl<C: Compositor> OpenXrData<C> {
             drop(data);
             self.session_data.0.write().unwrap().state = state;
         }
+    }
+
+    pub fn user_presence(&self) -> UserPresence {
+        match self.user_presence.load(Ordering::Relaxed) {
+            1 => UserPresence::Unknown,
+            2 => UserPresence::Present,
+            3 => UserPresence::NotPresent,
+            _ => UserPresence::Unsupported,
+        }
+    }
+
+    pub fn supports_user_presence(&self) -> bool {
+        self.enabled_extensions.ext_user_presence
+            && self.user_presence() != UserPresence::Unsupported
     }
 
     fn poll_events_impl(&self, session_data: &SessionData) -> Option<xr::SessionState> {
@@ -215,6 +265,18 @@ impl<C: Compositor> OpenXrData<C> {
                 xr::Event::InteractionProfileChanged(_) => {
                     if let Some(input) = self.input.get() {
                         input.interaction_profile_changed(session_data);
+                    }
+                }
+                xr::Event::UserPresenceChangedEXT(event) => {
+                    if self.supports_user_presence()
+                        && event.session() == session_data.session.as_raw()
+                    {
+                        let presence = if event.is_user_present() {
+                            UserPresence::Present
+                        } else {
+                            UserPresence::NotPresent
+                        };
+                        self.user_presence.store(presence as u8, Ordering::Relaxed);
                     }
                 }
                 _ => {
@@ -252,6 +314,10 @@ impl<C: Compositor> OpenXrData<C> {
         }
 
         *session_guard = ManuallyDrop::new(session);
+        if self.supports_user_presence() {
+            self.user_presence
+                .store(UserPresence::Unknown as u8, Ordering::Relaxed);
+        }
     }
 
     pub fn set_tracking_space(&self, space: vr::ETrackingUniverseOrigin) {

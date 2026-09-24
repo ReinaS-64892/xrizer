@@ -1,5 +1,5 @@
 use super::{
-    ActionData, Input, InteractionProfile,
+    ActionData, ActionSetKey, Input, InteractionProfile, SyntheticDigitalAction,
     profiles::{
         knuckles::Knuckles, oculus_touch::OculusTouch, simple_controller::SimpleController,
         vive_controller::ViveWands,
@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     input::ActionKey,
-    openxr_data::{FakeCompositor, Hand, OpenXrData},
+    openxr_data::{FakeCompositor, Hand, OpenXrData, UserPresence},
     vr::{self, IVRInput010_Interface},
 };
 use fakexr::UserPath::*;
@@ -18,6 +18,95 @@ use std::collections::HashSet;
 use std::f32::consts::FRAC_PI_4;
 use std::ffi::CStr;
 use std::sync::{Arc, Barrier};
+
+#[test]
+fn proximity_digital_state_follows_presence_and_sync() {
+    let set = ActionSetKey::from(KeyData::from_ffi(1));
+    let mut action = SyntheticDigitalAction::new(set);
+    for presence in [UserPresence::Unsupported, UserPresence::Unknown] {
+        action.update(presence, true);
+        let data = action.action_data(42);
+        assert!(!data.bActive);
+        assert!(!data.bChanged);
+    }
+
+    action.update(UserPresence::Present, true);
+    let data = action.action_data(42);
+    assert!(data.bActive && data.bState);
+    assert!(data.bChanged);
+    assert_eq!(data.activeOrigin, 42);
+
+    action.update(UserPresence::NotPresent, true);
+    let data = action.action_data(42);
+    assert!(data.bActive && !data.bState && data.bChanged);
+
+    action.update(UserPresence::Present, true);
+    let data = action.action_data(42);
+    assert!(data.bActive && data.bState && data.bChanged);
+
+    action.update(UserPresence::Present, true);
+    assert!(!action.action_data(42).bChanged);
+
+    action.update(UserPresence::Present, false);
+    assert!(!action.action_data(42).bActive);
+
+    let mut initially_removed = SyntheticDigitalAction::new(set);
+    initially_removed.update(UserPresence::Unknown, true);
+    initially_removed.update(UserPresence::NotPresent, true);
+    let data = initially_removed.action_data(42);
+    assert!(data.bActive && !data.bState && !data.bChanged);
+}
+
+#[test]
+fn proximity_action_reaches_openvr_digital_query() {
+    let fixture = Fixture::new();
+    fixture.load_actions(c"actions.json");
+    let handle = fixture.get_action_handle(c"/actions/set1/in/boolact");
+    let head = fixture.get_input_source_handle(c"/user/head");
+    let key = ActionKey::from(KeyData::from_ffi(handle));
+    let set = ActionSetKey::from(KeyData::from_ffi(1));
+    let mut proximity = SyntheticDigitalAction::new(set);
+
+    proximity.update(UserPresence::Unknown, true);
+    {
+        let session = fixture.input.openxr.session_data.get();
+        let actions = session.input_data.get_loaded_actions().unwrap();
+        actions
+            .proximity_actions
+            .lock()
+            .unwrap()
+            .insert(key, proximity);
+    }
+    assert!(!fixture.get_bool_state_hand(handle, head).unwrap().bActive);
+
+    for (presence, worn, changed) in [
+        (UserPresence::NotPresent, false, false),
+        (UserPresence::Present, true, true),
+        (UserPresence::NotPresent, false, true),
+    ] {
+        proximity.update(presence, true);
+        {
+            let session = fixture.input.openxr.session_data.get();
+            let actions = session.input_data.get_loaded_actions().unwrap();
+            actions
+                .proximity_actions
+                .lock()
+                .unwrap()
+                .insert(key, proximity);
+        }
+        let data = fixture.get_bool_state_hand(handle, head).unwrap();
+        assert!(data.bActive);
+        assert_eq!(data.bState, worn);
+        assert_eq!(data.bChanged, changed);
+        assert_eq!(data.activeOrigin, head);
+
+        let unrestricted = fixture.get_bool_state(handle).unwrap();
+        assert!(unrestricted.bActive);
+        assert_eq!(unrestricted.bState, worn);
+        assert_eq!(unrestricted.bChanged, changed);
+        assert_eq!(unrestricted.activeOrigin, head);
+    }
+}
 
 static ACTIONS_JSONS_DIR: &CStr = unsafe {
     CStr::from_bytes_with_nul_unchecked(

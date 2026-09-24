@@ -19,7 +19,7 @@ use crate::input::devices::ProfileData;
 use crate::input::profiles::RunWithProfile;
 use crate::{
     AtomicF32,
-    openxr_data::{self, Hand, OpenXrData, SessionData},
+    openxr_data::{self, Hand, OpenXrData, SessionData, UserPresence},
     tracy_span,
 };
 use custom_bindings::{BoolBindingData, GrabActions};
@@ -53,6 +53,7 @@ pub struct Input<C: openxr_data::Compositor> {
     input_source_map: RwLock<SlotMap<InputSourceKey, CString>>,
     left_hand_key: InputSourceKey,
     right_hand_key: InputSourceKey,
+    head_key: InputSourceKey,
     action_map: RwLock<SlotMap<ActionKey, Action>>,
     set_map: RwLock<SlotMap<ActionSetKey, String>>,
     loaded_actions_path: OnceLock<PathBuf>,
@@ -103,6 +104,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         let mut map = SlotMap::with_key();
         let left_hand_key = map.insert(c"/user/hand/left".into());
         let right_hand_key = map.insert(c"/user/hand/right".into());
+        let head_key = map.insert(c"/user/head".into());
         let subaction_paths = SubactionPaths::new(&openxr.instance);
         let pose_data = PoseData::new(
             &openxr.instance,
@@ -126,6 +128,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             loaded_actions_path: OnceLock::new(),
             left_hand_key,
             right_hand_key,
+            head_key,
             legacy_state: Default::default(),
             skeletal_tracking_level: RwLock::new(vr::EVRSkeletalTrackingLevel::Estimated),
             estimated_finger_state: [
@@ -434,6 +437,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         let index = match key {
             x if x == self.left_hand_key => Hand::Left as u32,
             x if x == self.right_hand_key => Hand::Right as u32,
+            x if x == self.head_key => vr::k_unTrackedDeviceIndex_Hmd,
             _ => {
                 unsafe {
                     info.write(Default::default());
@@ -957,11 +961,25 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
 
         let mut out = WriteOnDrop::new(action_data);
 
-        get_action_from_handle!(self, handle, session_data, action);
-        let subaction_path = get_subaction_path!(self, restrict_to_device, action_data);
+        get_action_from_handle!(self, handle, session_data, action, loaded);
         let ActionData::Bool(action) = &action else {
             return vr::EVRInputError::WrongType;
         };
+
+        let proximity = loaded
+            .proximity_actions
+            .lock()
+            .unwrap()
+            .get(&ActionKey::from(KeyData::from_ffi(handle)))
+            .copied();
+        if restrict_to_device == self.head_key.data().as_ffi() {
+            if let Some(proximity) = proximity {
+                *out.value = proximity.action_data(self.head_key.data().as_ffi());
+            }
+            return vr::EVRInputError::None;
+        }
+
+        let subaction_path = get_subaction_path!(self, restrict_to_device, action_data);
 
         let mut state = action.state(&session_data.session, subaction_path).unwrap();
 
@@ -973,6 +991,26 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         {
             state = binding_state;
             active_hand = binding_source;
+        }
+
+        if let Some(proximity) = proximity
+            && proximity.active
+        {
+            // OpenVR combines bindings for a digital action; a change in one source
+            // only changes the action when the combined value changes.
+            let worn = proximity.current == Some(true);
+            let controller_current = state.is_active && state.current_state;
+            let previous_controller =
+                state.is_active && (state.current_state ^ state.changed_since_last_sync);
+            let previous_proximity = worn ^ proximity.changed;
+            let combined = controller_current || worn;
+            let changed = combined != (previous_controller || previous_proximity);
+            if worn && !controller_current || !state.is_active {
+                active_hand = self.head_key.data().as_ffi();
+            }
+            state.current_state = combined;
+            state.is_active = true;
+            state.changed_since_last_sync = changed;
         }
 
         *out.value = vr::InputDigitalActionData_t {
@@ -1023,8 +1061,14 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             return vr::EVRInputError::NoActiveActionSet;
         }
 
+        self.openxr.poll_events();
+
         let active_sets =
             unsafe { std::slice::from_raw_parts(active_sets, active_set_count as usize) };
+        let active_set_keys: HashSet<_> = active_sets
+            .iter()
+            .map(|set| ActionSetKey::from(KeyData::from_ffi(set.ulActionSet)))
+            .collect();
 
         if active_sets
             .iter()
@@ -1065,6 +1109,11 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         {
             tracy_span!("xrSyncActions");
             data.session.sync_actions(&sync_sets).unwrap();
+        }
+
+        let presence = self.openxr.user_presence();
+        for action in actions.proximity_actions.lock().unwrap().values_mut() {
+            action.update(presence, active_set_keys.contains(&action.set));
         }
 
         let devices = data.input_data.devices.read().unwrap();
@@ -1604,7 +1653,7 @@ impl<C: openxr_data::Compositor> Input<C> {
 
 enum LoadedActions {
     Legacy(LegacyActionData),
-    Manifest(ManifestLoadedActions),
+    Manifest(Box<ManifestLoadedActions>),
 }
 
 struct ManifestLoadedActions {
@@ -1614,10 +1663,55 @@ struct ManifestLoadedActions {
     actions_with_custom_bindings: HashSet<ActionKey>,
     per_profile_pose_bindings: HashMap<xr::Path, SecondaryMap<ActionKey, BoundPose>>,
     per_profile_bindings: HashMap<xr::Path, SecondaryMap<ActionKey, Vec<BoolBindingData>>>,
+    proximity_actions: Mutex<HashMap<ActionKey, SyntheticDigitalAction>>,
     info_set: xr::ActionSet,
     _info_action: xr::Action<bool>,
     haptic_set: xr::ActionSet,
     haptic_action: xr::Action<xr::Haptic>,
+}
+
+#[derive(Clone, Copy)]
+struct SyntheticDigitalAction {
+    set: ActionSetKey,
+    current: Option<bool>,
+    active: bool,
+    changed: bool,
+}
+
+impl SyntheticDigitalAction {
+    fn new(set: ActionSetKey) -> Self {
+        Self {
+            set,
+            current: None,
+            active: false,
+            changed: false,
+        }
+    }
+
+    fn update(&mut self, presence: UserPresence, set_active: bool) {
+        let next = if set_active {
+            match presence {
+                UserPresence::Present => Some(true),
+                UserPresence::NotPresent => Some(false),
+                UserPresence::Unknown | UserPresence::Unsupported => None,
+            }
+        } else {
+            None
+        };
+        self.changed = next.is_some_and(|state| self.current.unwrap_or(false) != state);
+        self.current = next;
+        self.active = next.is_some();
+    }
+
+    fn action_data(self, origin: vr::VRInputValueHandle_t) -> vr::InputDigitalActionData_t {
+        vr::InputDigitalActionData_t {
+            bActive: self.active,
+            bState: self.current.unwrap_or(false),
+            bChanged: self.changed,
+            activeOrigin: if self.active { origin } else { 0 },
+            fUpdateTime: 0.0,
+        }
+    }
 }
 
 impl ManifestLoadedActions {

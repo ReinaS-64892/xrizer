@@ -9,7 +9,7 @@ use crate::input::{ActionData, BoundPose, ExtraActionData, Input, InteractionPro
 use crate::openxr_data::{self, Hand};
 use log::{info, trace, warn};
 use openxr as xr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(super) struct BindingsLoadContext<'a> {
     pub action_sets: &'a HashMap<String, xr::ActionSet>,
@@ -17,6 +17,7 @@ pub(super) struct BindingsLoadContext<'a> {
     pub extra_actions: HashMap<String, ExtraActionData>,
     pub per_profile_bindings: HashMap<xr::Path, HashMap<String, Vec<BoolBindingData>>>,
     pub per_profile_pose_bindings: HashMap<xr::Path, HashMap<String, BoundPose>>,
+    pub proximity_actions: HashSet<String>,
     pub grip_action: &'a xr::Action<xr::Posef>,
     pub info_action: &'a xr::Action<bool>,
     pub haptic_action: &'a xr::Action<xr::Haptic>,
@@ -38,6 +39,7 @@ impl<'a> BindingsLoadContext<'a> {
             extra_actions: Default::default(),
             per_profile_bindings: Default::default(),
             per_profile_pose_bindings: Default::default(),
+            proximity_actions: Default::default(),
             grip_action,
             info_action,
             haptic_action,

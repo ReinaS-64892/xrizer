@@ -155,6 +155,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             extra_actions,
             per_profile_bindings,
             per_profile_pose_bindings,
+            proximity_actions,
             ..
         } = binding_context;
 
@@ -196,6 +197,24 @@ impl<C: openxr_data::Compositor> Input<C> {
         let actions = action_map_to_secondary(&mut act_guard, actions);
         let extra_actions = action_map_to_secondary(&mut act_guard, extra_actions);
 
+        let proximity_actions: HashMap<ActionKey, super::SyntheticDigitalAction> =
+            proximity_actions
+                .into_iter()
+                .filter_map(|path| {
+                    let (set_path, _) = path.split_once("/in/")?;
+                    let action_key = act_guard
+                        .iter()
+                        .find_map(|(key, action)| (action.path == path).then_some(key))?;
+                    let set_key = set_guard
+                        .iter()
+                        .find_map(|(key, name)| (name == set_path).then_some(key))?;
+                    if !matches!(actions.get(action_key), Some(super::ActionData::Bool(_))) {
+                        return None;
+                    }
+                    Some((action_key, super::SyntheticDigitalAction::new(set_key)))
+                })
+                .collect();
+
         let mut actions_with_custom_bindings = HashSet::new();
         let per_profile_bindings = per_profile_bindings
             .into_iter()
@@ -233,6 +252,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             extra_actions,
             per_profile_bindings,
             per_profile_pose_bindings,
+            proximity_actions: std::sync::Mutex::new(proximity_actions),
             _info_action: info_action,
             info_set,
             haptic_action,
@@ -242,7 +262,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         session_data
             .input_data
             .actions
-            .set(super::LoadedActions::Manifest(loaded))
+            .set(super::LoadedActions::Manifest(Box::new(loaded)))
             .unwrap_or_else(|_| unreachable!());
         Ok(())
     }
@@ -284,7 +304,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 }
             };
 
-            let bindings = match serde_json::from_slice(&data) {
+            let bindings: bindings::Bindings = match serde_json::from_slice(&data) {
                 Ok(bindings) => bindings,
                 Err(e) => {
                     error!("Failed to parse bindings for {controller_type:?}: {e}");
@@ -292,7 +312,10 @@ impl<C: openxr_data::Compositor> Input<C> {
                 }
             };
 
+            bindings::collect_proximity_actions(&bindings.bindings, &mut context.proximity_actions);
+
             match controller_type {
+                actions::ControllerType::GenericHmd => {}
                 actions::ControllerType::Unknown(ref other) => {
                     info!("Ignoring bindings for unknown profile {other}")
                 }
