@@ -995,6 +995,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
 
         if let Some(proximity) = proximity
             && proximity.active
+            && restrict_to_device == vr::k_ulInvalidInputValueHandle
         {
             // OpenVR combines bindings for a digital action; a change in one source
             // only changes the action when the combined value changes.
@@ -1002,9 +1003,13 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             let controller_current = state.is_active && state.current_state;
             let previous_controller =
                 state.is_active && (state.current_state ^ state.changed_since_last_sync);
-            let previous_proximity = worn ^ proximity.changed;
+            let previous_combined = if state.is_active {
+                Some(previous_controller || proximity.previous.unwrap_or(false))
+            } else {
+                proximity.previous
+            };
             let combined = controller_current || worn;
-            let changed = combined != (previous_controller || previous_proximity);
+            let changed = previous_combined != Some(combined);
             if worn && !controller_current || !state.is_active {
                 active_hand = self.head_key.data().as_ffi();
             }
@@ -1673,6 +1678,7 @@ struct ManifestLoadedActions {
 #[derive(Clone, Copy)]
 struct SyntheticDigitalAction {
     set: ActionSetKey,
+    previous: Option<bool>,
     current: Option<bool>,
     active: bool,
     changed: bool,
@@ -1682,6 +1688,7 @@ impl SyntheticDigitalAction {
     fn new(set: ActionSetKey) -> Self {
         Self {
             set,
+            previous: None,
             current: None,
             active: false,
             changed: false,
@@ -1698,7 +1705,8 @@ impl SyntheticDigitalAction {
         } else {
             None
         };
-        self.changed = next.is_some_and(|state| self.current.unwrap_or(false) != state);
+        self.previous = self.current;
+        self.changed = next.is_some() && self.previous != next;
         self.current = next;
         self.active = next.is_some();
     }

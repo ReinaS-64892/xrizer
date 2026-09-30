@@ -47,6 +47,11 @@ fn proximity_digital_state_follows_presence_and_sync() {
     action.update(UserPresence::Present, true);
     assert!(!action.action_data(42).bChanged);
 
+    action.update(UserPresence::NotPresent, true);
+    assert!(action.action_data(42).bChanged);
+    action.update(UserPresence::NotPresent, true);
+    assert!(!action.action_data(42).bChanged);
+
     action.update(UserPresence::Present, false);
     assert!(!action.action_data(42).bActive);
 
@@ -54,7 +59,9 @@ fn proximity_digital_state_follows_presence_and_sync() {
     initially_removed.update(UserPresence::Unknown, true);
     initially_removed.update(UserPresence::NotPresent, true);
     let data = initially_removed.action_data(42);
-    assert!(data.bActive && !data.bState && !data.bChanged);
+    assert!(data.bActive && !data.bState && data.bChanged);
+    initially_removed.update(UserPresence::NotPresent, true);
+    assert!(!initially_removed.action_data(42).bChanged);
 }
 
 #[test]
@@ -63,6 +70,8 @@ fn proximity_action_reaches_openvr_digital_query() {
     fixture.load_actions(c"actions.json");
     let handle = fixture.get_action_handle(c"/actions/set1/in/boolact");
     let head = fixture.get_input_source_handle(c"/user/head");
+    let left = fixture.get_input_source_handle(c"/user/hand/left");
+    let right = fixture.get_input_source_handle(c"/user/hand/right");
     let key = ActionKey::from(KeyData::from_ffi(handle));
     let set = ActionSetKey::from(KeyData::from_ffi(1));
     let mut proximity = SyntheticDigitalAction::new(set);
@@ -80,8 +89,10 @@ fn proximity_action_reaches_openvr_digital_query() {
     assert!(!fixture.get_bool_state_hand(handle, head).unwrap().bActive);
 
     for (presence, worn, changed) in [
+        (UserPresence::NotPresent, false, true),
         (UserPresence::NotPresent, false, false),
         (UserPresence::Present, true, true),
+        (UserPresence::Present, true, false),
         (UserPresence::NotPresent, false, true),
     ] {
         proximity.update(presence, true);
@@ -105,6 +116,9 @@ fn proximity_action_reaches_openvr_digital_query() {
         assert_eq!(unrestricted.bState, worn);
         assert_eq!(unrestricted.bChanged, changed);
         assert_eq!(unrestricted.activeOrigin, head);
+        for hand in [left, right] {
+            assert!(!fixture.get_bool_state_hand(handle, hand).unwrap().bActive);
+        }
     }
 }
 
