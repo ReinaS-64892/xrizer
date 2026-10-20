@@ -22,7 +22,7 @@ use serde::{
     Deserialize,
     de::{Error, IgnoredAny, Unexpected},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::str::FromStr;
 
@@ -134,11 +134,15 @@ pub struct SimpleActionBinding {
 #[serde(from = "String")]
 enum MaybeInputPath {
     Valid(DynInputPath),
+    HeadProximity,
     Invalid { path: String, error: String },
 }
 
 impl From<String> for MaybeInputPath {
     fn from(value: String) -> Self {
+        if value == "/user/head/proximity" {
+            return Self::HeadProximity;
+        }
         match value.parse() {
             Ok(path) => Self::Valid(path),
             Err(error) => Self::Invalid { path: value, error },
@@ -187,7 +191,56 @@ impl<Inputs, Parameters> ActionBindingData<Inputs, Parameters> {
                 warn!("got invalid input path {path} - {error}");
                 None
             }
+            MaybeInputPath::HeadProximity => None,
         }
+    }
+}
+
+pub fn collect_proximity_actions(
+    bindings: &HashMap<String, ActionSetBinding>,
+    actions: &mut HashSet<String>,
+) {
+    // User presence arrives as an OpenXR event, so this source cannot be suggested as an action binding.
+    for set in bindings.values() {
+        for source in &set.sources {
+            if let ActionBinding::Button(data) = source
+                && matches!(data.path, MaybeInputPath::HeadProximity)
+                && let Some(click) = &data.inputs.click
+            {
+                actions.insert(click.output.path.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod proximity_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_only_head_proximity() {
+        let profile: super::super::actions::ControllerType =
+            serde_json::from_str("\"generic_hmd\"").unwrap();
+        assert!(matches!(
+            profile,
+            super::super::actions::ControllerType::GenericHmd
+        ));
+
+        let bindings: Bindings = serde_json::from_str(
+            r#"{"bindings":{"/actions/main":{"sources":[
+                {"mode":"button","path":"/user/head/proximity","inputs":{"click":{"output":"/actions/main/in/worn"}}},
+                {"mode":"button","path":"/user/hand/left/input/trigger","inputs":{"click":{"output":"/actions/main/in/left"}}},
+                {"mode":"button","path":"/user/hand/right/input/trigger","inputs":{"click":{"output":"/actions/main/in/right"}}},
+                {"mode":"button","path":"/user/head/other","inputs":{"click":{"output":"/actions/main/in/other"}}}
+            ]}}}"#,
+        )
+        .unwrap();
+        let mut actions = HashSet::new();
+        collect_proximity_actions(&bindings.bindings, &mut actions);
+        assert_eq!(
+            actions,
+            HashSet::from(["/actions/main/in/worn".to_string()])
+        );
     }
 }
 

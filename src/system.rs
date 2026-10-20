@@ -729,6 +729,14 @@ impl vr::IVRSystem026_Interface for System {
         err: *mut vr::ETrackedPropertyError,
     ) -> bool {
         debug!(target: log_tags::TRACKED_PROP, "requesting bool property: {prop:?} ({device_index})");
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd
+            && prop == vr::ETrackedDeviceProperty::ContainsProximitySensor_Bool
+        {
+            if let Some(err) = unsafe { err.as_mut() } {
+                *err = vr::ETrackedPropertyError::Success;
+            }
+            return self.openxr.supports_user_presence();
+        }
         if let Some(err) = unsafe { err.as_mut() } {
             *err = vr::ETrackedPropertyError::UnknownProperty;
         }
