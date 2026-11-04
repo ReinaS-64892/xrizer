@@ -86,6 +86,10 @@ _XRIZER_CUSTOM_BINDINGS_DIR_ - This can be used to supply a directory that xrize
 
 _XRIZER_TRACKER_SERIALS_ - This is a semi-colon (`;`) separated list of device serial numbers to use as generic trackers. Can be used to assign controllers as FBT trackers.
 
+Lighthouse base stations (serials starting with `LHB-`) are excluded from generic
+trackers, including `XRIZER_TRACKER_SERIALS`. Monado may expose their poses for
+calibration tools such as QuestLHSync; they are not body trackers.
+
 # See also
 
 - [OpenComposite](https://gitlab.com/znixian/OpenOVR) - The original OpenVR/OpenXR implementation, much more mature than xrizer. Some of the code in this repo was rewritten based on OpenComposite.
