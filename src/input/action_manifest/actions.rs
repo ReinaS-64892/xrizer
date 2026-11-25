@@ -41,6 +41,8 @@ pub enum ControllerType {
     ViveFocus3,
     Knuckles,
     FrameController,
+    #[serde(rename = "generic_hmd", alias = "hmd")]
+    GenericHmd,
     OculusTouch,
     #[serde(untagged)]
     Unknown(String),

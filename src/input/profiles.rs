@@ -62,6 +62,7 @@ impl ControllerType {
             Self::Knuckles => runner.run::<Knuckles>(),
             Self::FrameController => runner.run::<FrameController>(),
             Self::ViveFocus3 => runner.run::<ViveFocus3>(),
+            Self::GenericHmd => {}
             Self::Unknown(_) => {}
         }
     }
