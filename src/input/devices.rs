@@ -571,7 +571,11 @@ impl TrackedDeviceList {
             .enumerate_xdevs()?
             .into_iter()
             .filter(|xdev| {
-                xdev.can_create_space()
+                // Monado exposes Lighthouse base stations as pose-only trackers
+                // for calibration clients. Never offer these as body trackers,
+                // even when XRIZER_TRACKER_SERIALS explicitly includes them.
+                !xdev.serial().starts_with("LHB-")
+                    && xdev.can_create_space()
                     && (xdev.name().to_lowercase().contains("tracker")
                         || extra_tracker_serials.contains(&xdev.serial().to_string()))
             })
@@ -974,6 +978,34 @@ mod tests {
         fakexr::add_trackers(f.raw_session());
         refresh(&f);
         assert_eq!(serial(&f, 1), "FAKEXR-SERIAL");
+    }
+
+    #[test]
+    fn lighthouse_base_stations_are_not_body_trackers() {
+        let f = fixture();
+        frame(&f);
+        events(&f);
+        // FakeXR names every xdev FAKEXR-TRACKER, so references would
+        // otherwise pass the same automatic filter as body trackers.
+        fakexr::set_tracker_serials(
+            f.raw_session(),
+            &["LHB-12345678", "LHR-body", "LHB-ABCDEF00"],
+        );
+        refresh(&f);
+        assert_eq!(serial(&f, 1), "LHR-body");
+        assert_eq!(f.input.device_index_to_tracked_device_class(2), None);
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceActivated as u32, 1)]
+        );
+
+        fakexr::set_tracker_serials(
+            f.raw_session(),
+            &["LHB-ABCDEF00", "LHR-body", "LHB-12345678"],
+        );
+        refresh(&f);
+        assert_eq!(serial(&f, 1), "LHR-body");
+        assert!(events(&f).is_empty());
     }
 
     #[test]
