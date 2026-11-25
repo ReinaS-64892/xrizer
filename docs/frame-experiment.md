@@ -10,6 +10,10 @@ Frame 対応に加え、近接センサー、トラッカーの hotplug、Lighth
 
 作業ツリーをコミットまたは stash してから、xrizer 内で実行します。
 
+この作業ディレクトリの直下（WiVRn と xrizer が並ぶ場所）では、
+`./refresh-xrizer-frame.sh` で実行できます。競合時も
+`./refresh-xrizer-frame.sh --continue`、`./refresh-xrizer-frame.sh --abort` を使えます。
+
 ```bash
 git switch experiment/frame-rs-main
 bash tools/refresh-frame.sh

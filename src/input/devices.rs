@@ -859,13 +859,19 @@ mod skeletal_tests {
         assert!(left_controller.connected && right_controller.connected);
 
         let left_hand_tracker = match left_controller.get_type() {
-            TrackedDeviceType::Controller { hand_tracker, .. } => hand_tracker.as_ref().unwrap(),
+            TrackedDeviceType::Controller { hand_tracker, .. } => {
+                hand_tracker.as_ref().unwrap().as_raw()
+            }
             _ => unreachable!(),
         };
         let right_hand_tracker = match right_controller.get_type() {
-            TrackedDeviceType::Controller { hand_tracker, .. } => hand_tracker.as_ref().unwrap(),
+            TrackedDeviceType::Controller { hand_tracker, .. } => {
+                hand_tracker.as_ref().unwrap().as_raw()
+            }
             _ => unreachable!(),
         };
+        // frame_start_update refreshes hotplugged devices under the write lock.
+        drop(devices);
 
         let probe_tracking_level = |action, source| {
             let mut _transforms: [vr::VRBoneTransform_t; HandSkeletonBone::Count as usize] =
@@ -899,11 +905,11 @@ mod skeletal_tests {
         };
 
         fakexr::set_hand_tracker_data_source(
-            left_hand_tracker.as_raw(),
+            left_hand_tracker,
             xr::HandTrackingDataSourceEXT::CONTROLLER,
         );
         fakexr::set_hand_tracker_data_source(
-            right_hand_tracker.as_raw(),
+            right_hand_tracker,
             xr::HandTrackingDataSourceEXT::UNOBSTRUCTED,
         );
         frame();
