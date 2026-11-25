@@ -84,6 +84,21 @@ _RUST_LOG_ - This is used for adjusting the logging of xrizer. See the [env_logg
 
 _XRIZER_CUSTOM_BINDINGS_DIR_ - This can be used to supply a directory that xrizer will search for controller bindings files. Note that the format of these bindings aren't actually documented anywhere, but it's easy enough to modify an existing file, and xrizer parses them so you can read the source too.
 
+_XRIZER_GAME_POSE_PREDICTION_MS_ - Experimental limit on game-pose prediction,
+in whole milliseconds ahead of the current time. Defaults to `-1`, which uses
+the render display prediction without an additional limit. `0` requests current-time poses.
+Positive values predict up to the given duration, capped at the display time.
+If that display time has already passed, limited prediction uses the current time.
+This applies to HMD, controller and tracker poses returned through the compositor's
+game-pose outputs, including individual pose queries. Render poses keep their
+normal display prediction. Invalid or overflowing values fall back to `-1` with
+a warning. The variable is read when the compositor is created; restart the game
+after changing it. For example, in Steam launch options:
+
+```sh
+XRIZER_GAME_POSE_PREDICTION_MS=10 %command%
+```
+
 _XRIZER_TRACKER_SERIALS_ - This is a semi-colon (`;`) separated list of device serial numbers to use as generic trackers. Can be used to assign controllers as FBT trackers.
 
 Lighthouse base stations (serials starting with `LHB-`) are excluded from generic

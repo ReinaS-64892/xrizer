@@ -126,6 +126,18 @@ pub fn set_grip(session: xr::Session, path: UserPath, pose: xr::Posef) {
     get_hand_data(path, &session).grip_pose.store(pose);
 }
 
+/// Drain the target times requested through xrLocateSpace for this instance.
+pub fn take_locate_space_times(instance: xr::Instance) -> Vec<xr::Time> {
+    std::mem::take(
+        &mut *instance
+            .to_handle()
+            .unwrap()
+            .locate_space_times
+            .lock()
+            .unwrap(),
+    )
+}
+
 pub fn set_aim(session: xr::Session, path: UserPath, pose: xr::Posef) {
     let session = session.to_handle().unwrap();
     get_hand_data(path, &session).aim_pose.store(pose);
@@ -303,6 +315,8 @@ pub unsafe extern "system" fn get_instance_proc_addr(
                     (EnumerateReferenceSpaces),
                     CreateActionSpace,
                     LocateSpace,
+                    ConvertTimespecTimeToTimeKHR,
+                    ConvertTimeToTimespecTimeKHR,
                     (EnumerateViewConfigurations),
                     (EnumerateEnvironmentBlendModes),
                     (GetViewConfigurationProperties),
@@ -357,8 +371,8 @@ extern "system" fn enumerate_instance_extension_properties(
     properties: *mut xr::ExtensionProperties,
 ) -> xr::Result {
     assert!(layer_name.is_null());
-    unsafe { *property_count_output = 4 };
-    if property_capacity_input >= 4 {
+    unsafe { *property_count_output = 5 };
+    if property_capacity_input >= 5 {
         let props =
             unsafe { std::slice::from_raw_parts_mut(properties, property_capacity_input as usize) };
 
@@ -405,6 +419,17 @@ extern "system" fn enumerate_instance_extension_properties(
         let name =
             unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
         props[3].extension_name[..name.len()].copy_from_slice(name);
+
+        props[4] = xr::ExtensionProperties {
+            ty: xr::ExtensionProperties::TYPE,
+            next: std::ptr::null_mut(),
+            extension_name: [0 as c_char; xr::MAX_EXTENSION_NAME_SIZE],
+            extension_version: 1,
+        };
+        let name = xr::KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME;
+        let name =
+            unsafe { std::slice::from_raw_parts(name.as_ptr() as *const c_char, name.len()) };
+        props[4].extension_name[..name.len()].copy_from_slice(name);
     }
     xr::Result::SUCCESS
 }
@@ -472,6 +497,7 @@ struct EventDataBuffer {
 }
 
 struct Instance {
+    locate_space_times: Mutex<Vec<xr::Time>>,
     tracker_serials: Mutex<Vec<String>>,
     tracker_location_flags: Mutex<HashMap<String, xr::SpaceLocationFlags>>,
     event_receiver: Mutex<mpsc::Receiver<EventDataBuffer>>,
@@ -854,6 +880,7 @@ extern "system" fn create_instance(
         right
     });
     let inst = Arc::new(Instance {
+        locate_space_times: Mutex::default(),
         tracker_serials: Mutex::new(Vec::new()),
         tracker_location_flags: Mutex::new(HashMap::new()),
         event_receiver: rx.into(),
@@ -1539,10 +1566,37 @@ extern "system" fn get_current_interaction_profile(
     xr::Result::SUCCESS
 }
 
+extern "system" fn convert_timespec_time_to_time_k_h_r(
+    instance: xr::Instance,
+    timespec_time: *const libc::timespec,
+    time: *mut xr::Time,
+) -> xr::Result {
+    let _instance = get_handle!(instance);
+    unsafe {
+        *time = xr::Time::from_nanos(
+            (*timespec_time).tv_sec * 1_000_000_000 + (*timespec_time).tv_nsec,
+        );
+    }
+    xr::Result::SUCCESS
+}
+
+extern "system" fn convert_time_to_timespec_time_k_h_r(
+    instance: xr::Instance,
+    time: xr::Time,
+    timespec_time: *mut libc::timespec,
+) -> xr::Result {
+    let _instance = get_handle!(instance);
+    unsafe {
+        (*timespec_time).tv_sec = time.as_nanos() / 1_000_000_000;
+        (*timespec_time).tv_nsec = time.as_nanos() % 1_000_000_000;
+    }
+    xr::Result::SUCCESS
+}
+
 extern "system" fn locate_space(
     space: xr::Space,
     base_space: xr::Space,
-    _time: xr::Time,
+    time: xr::Time,
     location: *mut xr::SpaceLocation,
 ) -> xr::Result {
     let base_space = get_handle!(base_space);
@@ -1555,6 +1609,17 @@ extern "system" fn locate_space(
     );
 
     let space = get_handle!(space);
+    space
+        .session
+        .upgrade()
+        .unwrap()
+        .instance
+        .upgrade()
+        .unwrap()
+        .locate_space_times
+        .lock()
+        .unwrap()
+        .push(time);
     assert!(!matches!(
         space.ty,
         SpaceType::Reference(xr::ReferenceSpaceType::LOCAL)
