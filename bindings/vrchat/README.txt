@@ -16,8 +16,8 @@ Based on the locally installed VRChat Meta Touch default bindings:
 - Triggers: interaction / UI confirmation; grips: grab / drag.
 - Right A: jump; right B: Udon menu, following the Touch defaults.
 - Left D-pad down: microphone (Touch X).
-- Left D-pad right: Udon menu (Touch Y).
-- Left View / right Menu: Quick Menu.
+- Left D-pad right / right X: Quick Menu.
+- Left View / right Menu: unbound, available for the WiVRn menu shortcut.
 - Both hand skeletons, raw poses and haptics are included.
 - Action Menu, one-hand and drone bindings are retained from the Touch defaults.
 

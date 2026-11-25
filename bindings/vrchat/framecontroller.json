@@ -306,15 +306,6 @@
         {
           "inputs": {
             "click": {
-              "output": "/actions/global/in/udon_menu"
-            }
-          },
-          "mode": "button",
-          "path": "/user/hand/left/input/dpad_right"
-        },
-        {
-          "inputs": {
-            "click": {
               "output": "/actions/global/in/interact"
             }
           },
@@ -426,7 +417,7 @@
             }
           },
           "mode": "button",
-          "path": "/user/hand/left/input/view"
+          "path": "/user/hand/left/input/dpad_right"
         },
         {
           "inputs": {
@@ -468,7 +459,7 @@
             }
           },
           "mode": "button",
-          "path": "/user/hand/right/input/menu"
+          "path": "/user/hand/right/input/x"
         },
         {
           "inputs": {
@@ -901,7 +892,7 @@
   },
   "category": "steamvr_input",
   "controller_type": "frame_controller",
-  "description": "Based on VRChat Meta Touch defaults. Frame D-pad down/right replaces left X/Y; View/Menu opens Quick Menu. Experimental.",
+  "description": "Based on VRChat Meta Touch defaults. D-pad down toggles mic; D-pad right / right X opens Quick Menu. View/Menu unbound. Experimental.",
   "interaction_profile": "",
   "name": "VRChat Steam Frame bindings for xrizer",
   "options": {},
