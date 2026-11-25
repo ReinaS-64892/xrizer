@@ -39,7 +39,59 @@ pub struct Compositor {
     metrics: FrameMetrics,
     timing_mode: Mutex<vr::EVRCompositorTimingMode>,
     frame_state: Mutex<FrameState>,
+    game_pose_prediction: GamePosePrediction,
+    /// Per-frame gameplay target time, independent of the render-pose cache.
+    game_pose_time: Mutex<Option<xr::Time>>,
     focused: Once,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GamePosePrediction {
+    Limited(i64),
+    #[default]
+    DisplayTime,
+}
+
+impl GamePosePrediction {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().parse::<i64>().ok()? {
+            -1 => Some(Self::DisplayTime),
+            ms if ms >= 0 => ms.checked_mul(1_000_000).map(Self::Limited),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        let Some(value) = std::env::var_os("XRIZER_GAME_POSE_PREDICTION_MS") else {
+            return Self::default();
+        };
+        match value.to_str().and_then(Self::parse) {
+            Some(prediction) => {
+                info!("Game pose prediction: {value:?} ms");
+                prediction
+            }
+            None => {
+                warn!(
+                    "Invalid XRIZER_GAME_POSE_PREDICTION_MS={value:?}: expected -1 or a nonnegative integer in milliseconds; using -1"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    fn target_time(self, now: xr::Time, display_time: xr::Time) -> xr::Time {
+        match self {
+            Self::DisplayTime => display_time,
+            Self::Limited(limit_ns) => {
+                let now = now.as_nanos();
+                // A missed display deadline must not move gameplay into the past.
+                xr::Time::from_nanos(
+                    now.saturating_add(limit_ns)
+                        .min(display_time.as_nanos().max(now)),
+                )
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -95,8 +147,33 @@ impl Compositor {
             },
             timing_mode: vr::EVRCompositorTimingMode::Implicit.into(),
             frame_state: FrameState::Submitted.into(),
+            game_pose_prediction: GamePosePrediction::from_env(),
+            game_pose_time: Mutex::default(),
             focused: Once::new(),
         }
+    }
+
+    fn get_game_pose_time(&self) -> Result<xr::Time, vr::EVRCompositorError> {
+        let mut time = self.game_pose_time.lock().unwrap();
+        if let Some(time) = *time {
+            return Ok(time);
+        }
+        let display_time = self.openxr.display_time.get();
+        if self.game_pose_prediction == GamePosePrediction::DisplayTime {
+            *time = Some(display_time);
+            return Ok(display_time);
+        }
+        if !self.openxr.enabled_extensions.khr_convert_timespec_time {
+            crate::warn_once!("Limited game pose prediction requires XR_KHR_convert_timespec_time");
+            return Err(vr::EVRCompositorError::RequestFailed);
+        }
+        let now = self.openxr.instance.now().map_err(|e| {
+            warn!("Couldn't obtain current OpenXR time for game poses: {e}");
+            vr::EVRCompositorError::RequestFailed
+        })?;
+        let target = self.game_pose_prediction.target_time(now, display_time);
+        *time = Some(target);
+        Ok(target)
     }
 
     fn maybe_wait_frame(&self, session_data: &SessionData) {
@@ -245,6 +322,7 @@ impl openxr_data::Compositor for Compositor {
     ) {
         // This function is called while a write lock is called on the session, and as such should
         // not use self.openxr.session_data.get().
+        *self.game_pose_time.lock().unwrap() = None;
 
         let backend_data = self
             .tmp_backend
@@ -822,15 +900,21 @@ impl vr::IVRCompositor029_Interface for Compositor {
 
         let input = self.input.force(|_| Input::new(self.openxr.clone()));
 
-        let Some(pose) = input.get_device_pose(device_index, None) else {
-            return vr::EVRCompositorError::RequestFailed;
-        };
-
         if !output_pose.is_null() {
+            let Some(pose) = input.get_device_pose(device_index, None) else {
+                return vr::EVRCompositorError::RequestFailed;
+            };
             unsafe { output_pose.write(pose) };
         }
 
         if !output_game_pose.is_null() {
+            let time = match self.get_game_pose_time() {
+                Ok(time) => time,
+                Err(e) => return e,
+            };
+            let Some(pose) = input.get_device_pose_at(device_index, None, time) else {
+                return vr::EVRCompositorError::RequestFailed;
+            };
             unsafe { output_game_pose.write(pose) };
         }
 
@@ -844,24 +928,33 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("GetLastPoses impl");
-        if render_pose_count == 0 {
+        if render_pose_count == 0 && game_pose_count == 0 {
             return vr::EVRCompositorError::None;
         }
-        let render_poses = unsafe {
-            std::slice::from_raw_parts_mut(render_pose_array, render_pose_count as usize)
-        };
-        self.input
-            .force(|_| Input::new(self.openxr.clone()))
-            .get_poses(render_poses, None);
+        if (render_pose_count > 0 && render_pose_array.is_null())
+            || (game_pose_count > 0 && game_pose_array.is_null())
+        {
+            return vr::EVRCompositorError::RequestFailed;
+        }
+        let input = self.input.force(|_| Input::new(self.openxr.clone()));
+        if render_pose_count > 0 {
+            let render_poses = unsafe {
+                std::slice::from_raw_parts_mut(render_pose_array, render_pose_count as usize)
+            };
+            input.get_poses(render_poses, None);
+        }
 
-        // Not entirely sure how the game poses are supposed to differ from the render poses,
-        // but a lot of games use the game pose array for controller positions.
+        // Experimental: gameplay uses a configurable prediction limit instead
+        // of OpenVR's additional frame. Rendering keeps predictedDisplayTime.
         if game_pose_count > 0 {
+            let time = match self.get_game_pose_time() {
+                Ok(time) => time,
+                Err(e) => return e,
+            };
             let game_poses = unsafe {
                 std::slice::from_raw_parts_mut(game_pose_array, game_pose_count as usize)
             };
-            assert!(game_poses.len() <= render_poses.len());
-            game_poses.copy_from_slice(&render_poses[0..game_poses.len()]);
+            input.get_poses_at(game_poses, None, time);
         }
 
         vr::EVRCompositorError::None
@@ -906,6 +999,11 @@ impl vr::IVRCompositor029_Interface for Compositor {
         if let Some(input) = self.input.get() {
             input.frame_start_update();
         }
+
+        *self.game_pose_time.lock().unwrap() = None;
+        // Capture even when only render poses are requested, so later game-pose
+        // queries in this frame refer to the same moment.
+        let _ = self.get_game_pose_time();
 
         self.GetLastPoses(
             render_pose_array,
@@ -1553,9 +1651,16 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_game_pose_prediction(GamePosePrediction::default())
+        }
+
+        fn with_game_pose_prediction(prediction: GamePosePrediction) -> Self {
             let xr = Arc::new(OpenXrData::new(&Injector::default()).unwrap());
             let vk = Arc::new(VulkanData::new_temporary(&xr.instance, xr.system_id));
-            let comp = Arc::new(Compositor::new(xr.clone(), &Injector::default()));
+            let mut comp = Compositor::new(xr.clone(), &Injector::default());
+            // Keep tests independent of the environment of the test runner.
+            comp.game_pose_prediction = prediction;
+            let comp = Arc::new(comp);
             xr.compositor.set(Arc::downgrade(&comp));
             crate::init_logging();
 
@@ -1685,6 +1790,206 @@ mod tests {
 
         assert_eq!(f.wait_get_poses(), None);
         assert_eq!(f.submit(vr::EVREye::Left), None);
+    }
+
+    #[test]
+    fn game_pose_prediction_parses_limits_and_defaults_to_display_time() {
+        assert_eq!(
+            GamePosePrediction::default(),
+            GamePosePrediction::DisplayTime
+        );
+        assert_eq!(
+            GamePosePrediction::parse("-1"),
+            Some(GamePosePrediction::DisplayTime)
+        );
+        assert_eq!(
+            GamePosePrediction::parse("0"),
+            Some(GamePosePrediction::Limited(0))
+        );
+        assert_eq!(
+            GamePosePrediction::parse(" 10 "),
+            Some(GamePosePrediction::Limited(10_000_000))
+        );
+        for value in [
+            "",
+            "-2",
+            "1.5",
+            "NaN",
+            "infinity",
+            "abc",
+            "9223372036854775807",
+            "9223372036854775808",
+        ] {
+            assert_eq!(GamePosePrediction::parse(value), Option::None, "{value}");
+        }
+    }
+
+    #[test]
+    fn game_pose_prediction_caps_at_display_time_and_handles_late_frames() {
+        let now = xr::Time::from_nanos(1_000_000_000);
+        let display = xr::Time::from_nanos(1_040_000_000);
+        for (limit, expected) in [
+            (0, 1_000_000_000),
+            (10_000_000, 1_010_000_000),
+            (100_000_000, 1_040_000_000),
+        ] {
+            assert_eq!(
+                GamePosePrediction::Limited(limit)
+                    .target_time(now, display)
+                    .as_nanos(),
+                expected
+            );
+        }
+        let past_display = xr::Time::from_nanos(900_000_000);
+        assert_eq!(
+            GamePosePrediction::Limited(10_000_000).target_time(now, past_display),
+            now
+        );
+        assert_eq!(
+            GamePosePrediction::DisplayTime.target_time(now, past_display),
+            past_display
+        );
+        assert_eq!(
+            GamePosePrediction::Limited(10_000_000)
+                .target_time(
+                    xr::Time::from_nanos(i64::MAX - 5),
+                    xr::Time::from_nanos(i64::MAX),
+                )
+                .as_nanos(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn game_pose_prediction_changes_only_game_query_times() {
+        for prediction in [
+            GamePosePrediction::default(),
+            GamePosePrediction::parse("-1").unwrap(),
+            GamePosePrediction::parse("10").unwrap(),
+            GamePosePrediction::Limited(i64::MAX),
+        ] {
+            let f = Fixture::with_game_pose_prediction(prediction);
+            f.comp.SetTrackingSpace(vr::ETrackingUniverseOrigin::Seated);
+            let xr = &f.comp.openxr;
+            let before = xr.instance.now().unwrap();
+            let display_time = xr::Time::from_nanos(before.as_nanos() + 60_000_000_000);
+            xr.display_time.set(display_time);
+            let mut render = vr::TrackedDevicePose_t::default();
+            let mut game = vr::TrackedDevicePose_t::default();
+            assert_eq!(f.comp.WaitGetPoses(&mut render, 1, &mut game, 1), None);
+            let after = xr.instance.now().unwrap();
+            let times = fakexr::take_locate_space_times(xr.instance.as_raw());
+            assert_eq!(times[0], display_time);
+            assert!(render.bPoseIsValid && game.bPoseIsValid);
+            let game_time = f.comp.game_pose_time.lock().unwrap().unwrap();
+            match prediction {
+                GamePosePrediction::Limited(10_000_000) => {
+                    assert_eq!(times, vec![display_time, game_time]);
+                    assert!(
+                        (before.as_nanos() + 10_000_000..=after.as_nanos() + 10_000_000)
+                            .contains(&game_time.as_nanos())
+                    );
+                    assert!(game_time.as_nanos() < display_time.as_nanos());
+                }
+                _ => {
+                    assert_eq!(game_time, display_time);
+                    // At the same target time, the two outputs may share the cache.
+                    assert_eq!(times, vec![display_time]);
+                }
+            }
+            assert_eq!(
+                f.comp
+                    .GetLastPoseForTrackedDeviceIndex(0, &mut render, &mut game),
+                None
+            );
+            assert!(fakexr::take_locate_space_times(xr.instance.as_raw()).is_empty());
+        }
+    }
+
+    #[test]
+    fn game_poses_use_current_time_and_render_poses_keep_display_prediction() {
+        let f = Fixture::with_game_pose_prediction(GamePosePrediction::Limited(0));
+        f.comp.SetTrackingSpace(vr::ETrackingUniverseOrigin::Seated);
+        let xr = &f.comp.openxr;
+        let before = xr.instance.now().unwrap();
+        let display_time = xr::Time::from_nanos(before.as_nanos() + 80_000_000);
+        xr.display_time.set(display_time);
+        let mut render = vr::TrackedDevicePose_t::default();
+        let mut game = vr::TrackedDevicePose_t::default();
+
+        assert_eq!(f.comp.WaitGetPoses(&mut render, 1, &mut game, 1), None);
+        let after = xr.instance.now().unwrap();
+        let times = fakexr::take_locate_space_times(xr.instance.as_raw());
+        assert_eq!(times.len(), 2);
+        assert_eq!(times[0], display_time);
+        let game_time = times[1];
+        assert!((before.as_nanos()..=after.as_nanos()).contains(&game_time.as_nanos()));
+        assert_ne!(game_time, display_time);
+        assert!(render.bPoseIsValid && game.bPoseIsValid);
+
+        // Both array and individual queries reuse their respective frame poses.
+        assert_eq!(f.comp.GetLastPoses(&mut render, 1, &mut game, 1), None);
+        assert_eq!(
+            f.comp
+                .GetLastPoseForTrackedDeviceIndex(0, &mut render, &mut game),
+            None
+        );
+        assert!(fakexr::take_locate_space_times(xr.instance.as_raw()).is_empty());
+
+        let before_next = xr.instance.now().unwrap();
+        assert_eq!(f.comp.WaitGetPoses(&mut render, 1, &mut game, 1), None);
+        let times = fakexr::take_locate_space_times(xr.instance.as_raw());
+        assert_eq!(times.len(), 2);
+        assert_eq!(times[0], display_time);
+        assert!(times[1].as_nanos() >= before_next.as_nanos());
+        assert!(times[1].as_nanos() > game_time.as_nanos());
+    }
+
+    #[test]
+    fn game_poses_can_be_requested_without_render_poses() {
+        let f = Fixture::with_game_pose_prediction(GamePosePrediction::Limited(0));
+        f.comp.SetTrackingSpace(vr::ETrackingUniverseOrigin::Seated);
+        let mut game = [vr::TrackedDevicePose_t::default(); 3];
+        // No render poses, and a game array longer than the render array.
+        assert_eq!(
+            f.comp
+                .WaitGetPoses(std::ptr::null_mut(), 0, game.as_mut_ptr(), 3),
+            None
+        );
+        assert!(game[0].bPoseIsValid);
+        assert!(!game[1].bDeviceIsConnected && !game[2].bDeviceIsConnected);
+        let times = fakexr::take_locate_space_times(f.comp.openxr.instance.as_raw());
+        assert_eq!(times.len(), 1);
+        assert_ne!(times[0], f.comp.openxr.display_time.get());
+        assert_eq!(
+            f.comp
+                .GetLastPoseForTrackedDeviceIndex(0, std::ptr::null_mut(), &mut game[0]),
+            None
+        );
+        assert!(fakexr::take_locate_space_times(f.comp.openxr.instance.as_raw()).is_empty());
+    }
+
+    #[test]
+    fn game_pose_time_is_captured_even_when_only_render_poses_are_requested() {
+        let f = Fixture::with_game_pose_prediction(GamePosePrediction::Limited(0));
+        f.comp.SetTrackingSpace(vr::ETrackingUniverseOrigin::Seated);
+        let mut render = vr::TrackedDevicePose_t::default();
+        assert_eq!(
+            f.comp.WaitGetPoses(&mut render, 1, std::ptr::null_mut(), 0),
+            None
+        );
+        let game_time = f.comp.game_pose_time.lock().unwrap().unwrap();
+        fakexr::take_locate_space_times(f.comp.openxr.instance.as_raw());
+        let mut game = vr::TrackedDevicePose_t::default();
+        assert_eq!(
+            f.comp
+                .GetLastPoseForTrackedDeviceIndex(0, std::ptr::null_mut(), &mut game),
+            None
+        );
+        assert_eq!(
+            fakexr::take_locate_space_times(f.comp.openxr.instance.as_raw()),
+            vec![game_time]
+        );
     }
 
     #[test]
